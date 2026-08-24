@@ -13,6 +13,85 @@ from db import get_connection
 # ======================================================================
 # SECTION 1: BASIC HELPERS
 # ======================================================================
+# ======================================================================
+# SECTION 2: FEFO CONSUMPTION ENGINE
+# ======================================================================
+
+def check_stock_available(ingredient_id, quantity_needed, exclude_expired=False, as_of_date=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    reference_date = as_of_date or today_str()
+    if exclude_expired:
+        cur.execute("""
+            SELECT COALESCE(SUM(quantity_remaining), 0) AS total
+            FROM batches
+            WHERE ingredient_id = ? AND quantity_remaining > 0 AND expiry_date >= ?
+        """, (ingredient_id, reference_date))
+    else:
+        cur.execute("""
+            SELECT COALESCE(SUM(quantity_remaining), 0) AS total
+            FROM batches
+            WHERE ingredient_id = ? AND quantity_remaining > 0
+        """, (ingredient_id,))
+    total_available = cur.fetchone()["total"]
+    conn.close()
+    return total_available >= quantity_needed, round(total_available, 2)
+
+
+def consume_stock_fefo(ingredient_id, quantity_needed, conn=None, source_type=None, source_id=None, exclude_expired=False, as_of_date=None):
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+
+    cur = conn.cursor()
+    reference_date = as_of_date or today_str()
+
+    if exclude_expired:
+        cur.execute("""
+            SELECT batch_id, quantity_remaining
+            FROM batches
+            WHERE ingredient_id = ? AND quantity_remaining > 0 AND expiry_date >= ?
+            ORDER BY expiry_date ASC, batch_id ASC
+        """, (ingredient_id, reference_date))
+    else:
+        cur.execute("""
+            SELECT batch_id, quantity_remaining
+            FROM batches
+            WHERE ingredient_id = ? AND quantity_remaining > 0
+            ORDER BY expiry_date ASC, batch_id ASC
+        """, (ingredient_id,))
+    batches = cur.fetchall()
+
+    total_available = sum(b["quantity_remaining"] for b in batches)
+    if total_available < quantity_needed:
+        if own_conn:
+            conn.close()
+        reason = " (excluding expired batches)" if exclude_expired else ""
+        return False, f"Not enough stock{reason}. Available: {round(total_available, 2)}, Needed: {quantity_needed}"
+
+    remaining_to_deduct = quantity_needed
+    for b in batches:
+        if remaining_to_deduct <= 0:
+            break
+        take = min(b["quantity_remaining"], remaining_to_deduct)
+        cur.execute(
+            "UPDATE batches SET quantity_remaining = ROUND(quantity_remaining - ?, 6) WHERE batch_id = ?",
+            (take, b["batch_id"])
+        )
+        if source_type and source_id:
+            cur.execute("""
+                INSERT INTO batch_consumption (batch_id, source_type, source_id, quantity)
+                VALUES (?, ?, ?, ?)
+            """, (b["batch_id"], source_type, source_id, take))
+        remaining_to_deduct -= take
+
+    if own_conn:
+        conn.commit()
+        conn.close()
+
+    return True, "Stock deducted successfully (FEFO)"
+
 
 def today_str():
     return date.today().isoformat()
