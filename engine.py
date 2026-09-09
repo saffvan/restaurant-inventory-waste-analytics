@@ -92,6 +92,63 @@ def consume_stock_fefo(ingredient_id, quantity_needed, conn=None, source_type=No
 
     return True, "Stock deducted successfully (FEFO)"
 
+def reverse_consumption(source_type, source_id, conn=None):
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT batch_id, quantity FROM batch_consumption
+        WHERE source_type = ? AND source_id = ?
+    """, (source_type, source_id))
+    records = cur.fetchall()
+
+    for r in records:
+        cur.execute(
+            "UPDATE batches SET quantity_remaining = ROUND(quantity_remaining + ?, 6) WHERE batch_id = ?",
+            (r["quantity"], r["batch_id"])
+        )
+
+    cur.execute(
+        "DELETE FROM batch_consumption WHERE source_type = ? AND source_id = ?",
+        (source_type, source_id)
+    )
+
+    if own_conn:
+        conn.commit()
+        conn.close()
+
+
+def get_actual_cost_for_source(source_type, source_id, conn=None):
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT bc.quantity, b.unit_cost
+        FROM batch_consumption bc
+        JOIN batches b ON bc.batch_id = b.batch_id
+        WHERE bc.source_type = ? AND bc.source_id = ?
+    """, (source_type, source_id))
+    records = cur.fetchall()
+
+    if own_conn:
+        conn.close()
+
+    if not records:
+        return 0.0, 0.0, 0.0
+
+    total_cost = sum(r["quantity"] * r["unit_cost"] for r in records)
+    total_quantity = sum(r["quantity"] for r in records)
+    weighted_avg_unit_cost = total_cost / total_quantity if total_quantity > 0 else 0.0
+
+    return round(total_cost, 2), round(total_quantity, 2), round(weighted_avg_unit_cost, 2)
+
+
 
 def today_str():
     return date.today().isoformat()
